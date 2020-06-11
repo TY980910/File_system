@@ -5,10 +5,13 @@
 #include<stdio.h>
 #include<string.h>
 #include"stat.h"
+#include"defs.h"
 
 #define min(a,b) ( (a) < (b)? (a):(b))
 
 struct superblock sb;
+
+static struct inode* iget(uint inum);
 
 void mkfs()
 {
@@ -26,6 +29,49 @@ void mkfs()
     memmove(&tmp,bp->data,sizeof(tmp));
     bwrite(bp);
     brelse(bp);
+
+    //将dinode清空
+    int i;
+    for (i=2; i<2+NDSKINODE; i++)
+    {
+        bp = bread(i);
+        memset(bp->data,0,BSIZE);
+        bwrite(bp);
+        brelse(bp);
+    }
+
+
+    //将bitmap从重新清空
+    for (i = tmp.bmapstart; i<tmp.bmapstart+NDBITMAP; i++)
+    {
+        bp = bread(i);
+        memset(bp->data,0,BSIZE);
+        bwrite(bp);
+        brelse(bp);
+    }
+
+    //将17块前面标记为占用
+    bp = bread(tmp.bmapstart);
+    int m;
+    for (i =0; i<1+1+NDSKINODE+NDBITMAP; i++)
+    {
+        m = 1 <<(i%8);
+        bp->data[i/8] |= m;
+    }
+    bwrite(bp);
+    brelse(bp);
+
+    //将inode的第一块设置为/目录
+    bp = bread(IBLOCK(ROOTINO,tmp));
+    struct dinode *dip;
+    dip = (struct dinode*)bp->data + ROOTINO%IPB;
+    dip->type = T_DIR;
+    dip->nlink = 0;
+    dip->size = 0;
+    for (i=0; i<NDIRECT + 1; i++)
+        dip->addrs[i] = 0;
+    bwrite(bp);
+    brelse(bp);
 }
 
 
@@ -38,7 +84,7 @@ void readsb(struct superblock *sb)
     brelse(bp);
 }
 
-static void b_zero(int bno)
+static void b_zero(uint bno)
 {
     struct buf *bp;
     bp = bread(bno);
@@ -65,8 +111,8 @@ static uint balloc()
                 bp->data[bi/8] |= m;
                 bwrite(bp);
                 brelse(bp);
-                b_zero(b+bi);
-                return b+bi;
+                b_zero(bi+b);
+                return b + bi;
             }
 
          brelse(bp);
@@ -107,26 +153,29 @@ void icache_init()
            );
 }
 
-static struct inode* iget(uint inum);
-
 
 struct inode* ialloc(short type)
 {
     int inum;
     struct buf *bp;
     struct dinode *dip;
-
+    struct inode *x;
     for (inum = 1; inum < sb.ninodes; inum++)
     {
+
         bp = bread(IBLOCK(inum,sb));
         dip = (struct dinode*)bp->data + inum%IPB;
+
+
         if (dip->type == 0)
         {
             memset(dip,0,sizeof(*dip));
             dip->type = type;
             bwrite(bp);
             brelse(bp);
-            return iget(inum);
+            x = iget(inum);
+            x->type = type;
+            return x;
         }
     }
 
@@ -171,9 +220,19 @@ static struct inode* iget(uint inum)
         assert(0);
     }
 
+    struct buf *bp;
+    struct dinode *dip;
     ip = empty;
     ip->inum = inum;
     ip->ref = 1;
+
+    bp = bread(IBLOCK(inum,sb));
+    dip = (struct dinode*)bp->data + inum % IPB;
+    ip->type = dip->type;
+    ip->nlink = dip->nlink;
+    ip->size = dip->size;
+    memmove(ip->addrs,dip->addrs,sizeof(dip->addrs));
+    brelse(bp);
 
     return ip;
 }
@@ -301,16 +360,16 @@ int readi(struct inode *ip, char *dst, uint off, uint n)
     return n;
 }
 
-int writei(struct inode *ip, char *src, uint off, int n)
+int writei(struct inode *ip, char *src, uint off, uint n)
 {
-
     uint tot,m;
     struct buf *bp;
-
     if (off > ip->size || off + n < off)
         return -1;
+
     if (off + n > MAXFILE * BSIZE)
         return -1;
+
     for (tot=0; tot<n; tot+=m, off+=m, src+=m)
     {
         bp = bread(bmap(ip,off/BSIZE));
@@ -320,12 +379,13 @@ int writei(struct inode *ip, char *src, uint off, int n)
         brelse(bp);
     }
 
+
+
     if (n > 0 && off > ip->size)
     {
         ip->size = off;
         iupdate(ip);
     }
-
     return n;
 }
 
@@ -408,7 +468,7 @@ int dirlink(struct inode *dp, char *name, uint inum)
 ///////////////////////////
 //paths
 
- static char *skipelem(char *path, char*name)
+static char *skipelem(char *path, char*name)
 {
     char *s;
     int len;
@@ -433,11 +493,19 @@ int dirlink(struct inode *dp, char *name, uint inum)
     return path;
 }
 
+struct inode *get_current()
+{
+    return iget(ROOTINO);
+}
+
 static struct inode *namex(char *path, int nameiparent, char *name)
 {
     struct inode  *ip,*next;
 
-    ip = iget(ROOTINO);
+    if (*path == '/')
+        ip = iget(ROOTINO);
+    else
+        ip = get_current();
 
     while ((path = skipelem(path,name)) != 0)
     {
